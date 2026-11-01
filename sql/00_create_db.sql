@@ -1,3 +1,6 @@
--- 建立專案資料庫（已存在就略過，可重複執行）
-IF DB_ID('vn1_da') IS NULL
-    CREATE DATABASE vn1_da;
+-- Create the project database (skipped if it already exists, safe to rerun)
+-- The name is passed in by Python from SQL_DATABASE in .env
+DECLARE @db sysname = ?;
+DECLARE @sql nvarchar(max) = N'CREATE DATABASE ' + QUOTENAME(@db);
+IF DB_ID(@db) IS NULL
+    EXEC (@sql);
