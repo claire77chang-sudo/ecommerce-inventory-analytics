@@ -13,6 +13,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
+from sqlalchemy.types import Date
 
 from load_raw import load_raw
 
@@ -103,7 +104,8 @@ def main() -> None:
 
     engine = get_engine()
     for name, df in tables.items():
-        df.to_sql(name, engine, if_exists="replace", index=False, chunksize=50_000)
+        df["week"] = pd.to_datetime(df["week"]).dt.date
+        df.to_sql(name, engine, if_exists="replace", index=False, chunksize=50_000, dtype={"week": Date()})
         with engine.connect() as conn:
             n = conn.execute(text(f"SELECT COUNT(*) FROM {name}")).scalar()
         print(f"[{name}] written to SQL Server: {n:,} rows {'OK' if n == len(df) else 'FAIL'}")
