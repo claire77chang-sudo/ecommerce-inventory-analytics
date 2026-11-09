@@ -1,7 +1,8 @@
 """2.2.1 ABC classification and growth rate (Phase 0 only).
 
 ABC  : last 52 weeks, usage value = annualised demand x unit_cost,
-       cumulative 80 / 15 / 5 %, products without unit_cost -> 'U'
+       cumulative 80 / 15 / 5 %, products without unit_cost -> 'U',
+       duplicated copies (product_master.dup_keep = 0) -> 'D', not ranked
 Demand: suspected_stockout = 1 weeks replaced by the series' mean of
         non-stockout weeks in the same window
 New item: listed < 13 weeks in the ABC window, flagged only
@@ -40,12 +41,16 @@ def load():
         )).scalar()
     if not has_flag:
         raise SystemExit("suspected_stockout not found: run stockout_flag.py first")
+    with eng.connect() as con:
+        has_dup = con.execute(text("SELECT COL_LENGTH('dbo.product_master', 'dup_keep')")).scalar()
+    if has_dup is None:
+        raise SystemExit("dup_keep not found: run product_master.py first")
 
     long = pd.read_sql(
         "SELECT warehouse, product, week, sales, suspected_stockout "
         f"FROM dbo.phase0_long WHERE week <= '{LAST_WEEK:%Y-%m-%d}'", eng)
     master = pd.read_sql(
-        "SELECT product, client, launch_week FROM dbo.product_master", eng)
+        "SELECT product, client, launch_week, dup_keep FROM dbo.product_master", eng)
     cost = pd.read_sql("SELECT product, unit_cost FROM dbo.product_cost", eng)
     return eng, long, master, cost
 
@@ -84,7 +89,8 @@ def filled_demand(long, weeks):
 
 def classify_abc(df):
     df = df.copy()
-    has_cost = df["unit_cost"].notna()
+    is_dup = df["dup_keep"].eq(0) if "dup_keep" in df else pd.Series(False, index=df.index)
+    has_cost = df["unit_cost"].notna() & ~is_dup
     ranked = df[has_cost].sort_values("usage_value", ascending=False)
     total = ranked["usage_value"].sum()
     share = ranked["usage_value"] / total
@@ -94,7 +100,8 @@ def classify_abc(df):
     df["usage_share"] = share
     df["cum_share"] = share.cumsum()
     df["abc_class"] = pd.Series(cls, index=ranked.index)
-    df.loc[~has_cost, "abc_class"] = "U"
+    df.loc[df["unit_cost"].isna(), "abc_class"] = "U"
+    df.loc[is_dup, "abc_class"] = "D"
     df["abc_rank"] = pd.Series(np.arange(1, len(ranked) + 1), index=ranked.index)
     return df
 
@@ -146,7 +153,7 @@ def build(long, master, cost):
 
 # ---------------------------------------------------------------- report
 def summaries(df, threshold):
-    order = ["A", "B", "C", "U"]
+    order = ["A", "B", "C", "U", "D"]
     g = df.groupby("abc_class")
     abc = pd.DataFrame({
         "products": g.size(),
@@ -155,7 +162,8 @@ def summaries(df, threshold):
         "filled_weeks": g["abc_filled_weeks"].sum(),
     }).reindex(order).fillna(0)
     abc["product_share"] = abc["products"] / abc["products"].sum()
-    abc["usage_share"] = abc["usage_value"] / abc["usage_value"].sum()
+    ranked = abc.index.isin(["A", "B", "C"])
+    abc["usage_share"] = np.where(ranked, abc["usage_value"] / abc.loc[ranked, "usage_value"].sum(), np.nan)
 
     gr = (df.groupby(["abc_class", "growth_status"]).agg(
             products=("product", "size"),
@@ -170,7 +178,7 @@ def summaries(df, threshold):
 
 
 def check(df):
-    s = df.loc[df["abc_class"] != "U", "usage_share"].sum()
+    s = df.loc[df["abc_class"].isin(["A", "B", "C"]), "usage_share"].sum()
     if not np.isclose(s, 1):
         raise SystemExit(f"usage shares sum to {s}, not 1")
     if df["abc_class"].isna().any():
