@@ -2,7 +2,7 @@
 2.1.2 Seasonal index (group level).
 
 Steps
-1. Load series-week rows from phase0_long (up to 2023-09-25), join product_master.
+1. Load series-week rows from phase0_long (up to last_week, default 2023-09-25), join product_master.
 2. Drop suspected stockout weeks (suspected_stockout = 1, NULL kept).
 3. Detrend: fit a straight line to log(overall mean sales per series-week),
    divide every series-week by its week's trend value.
@@ -15,7 +15,11 @@ Steps
 6. Small clients (fewer than MIN_PRODUCTS products) fall back to the overall index.
    The Q4 stability check is always reported; it changes the table only when
    APPLY_Q4_STABILITY is True.
-7. Write outputs/seasonal_index.csv for 3.1.1.
+7. Write seasonal_index.csv for 3.1.1.
+
+run(..., last_week=..., out_dir=...) lets 3.1.1 recompute the index with data up to
+an earlier cutoff (internal validation) without overwriting the main outputs.
+Defaults reproduce the 2.1.2 result.
 
 Read-only on SQL. Outputs overwrite CSVs of the same name.
 """
@@ -44,14 +48,14 @@ OUT_DIR = Path(__file__).resolve().parents[1] / "outputs"
 
 
 # ---------------- load ----------------
-def load_data():
+def load_data(last_week=LAST_WEEK):
     from to_long import get_engine
 
     engine = get_engine()
     long_sql = f"""
         SELECT client, warehouse, product, week, sales, suspected_stockout
         FROM dbo.phase0_long
-        WHERE week <= '{LAST_WEEK}'
+        WHERE week <= '{last_week}'
     """
     master_sql = "SELECT product, price_band FROM dbo.product_master"
     long_df = pd.read_sql(long_sql, engine)
@@ -59,14 +63,14 @@ def load_data():
     return long_df, master
 
 
-def prepare(long_df, master):
+def prepare(long_df, master, last_week=LAST_WEEK):
     df = long_df.copy()
     df["week"] = pd.to_datetime(df["week"])
-    df = df[df["week"] <= pd.Timestamp(LAST_WEEK)]
+    df = df[df["week"] <= pd.Timestamp(last_week)]
     df = df.merge(master[["product", "price_band"]], on="product", how="left")
     n_all = len(df)
     df = df[df["suspected_stockout"].fillna(0).astype(int) != 1].copy()
-    print(f"Rows loaded: {n_all:,}  suspected stockout dropped: {n_all - len(df):,}  remaining: {len(df):,}")
+    print(f"Data up to {last_week}. Rows loaded: {n_all:,}  suspected stockout dropped: {n_all - len(df):,}  remaining: {len(df):,}")
     df["ym"] = df["week"].dt.strftime("%Y-%m")   # week assigned to month by start date
     df["year"] = df["week"].dt.year
     df["month"] = df["week"].dt.month
@@ -74,7 +78,7 @@ def prepare(long_df, master):
 
 
 # ---------------- step 3: detrend ----------------
-def detrend(df, exclude, verbose=True):
+def detrend(df, exclude, verbose=True, out_dir=OUT_DIR):
     weekly = df.groupby("week")["sales"].mean().rename("mean_sales").reset_index()
     weekly = weekly.sort_values("week").reset_index(drop=True)
     if (weekly["mean_sales"] <= 0).any():
@@ -109,7 +113,7 @@ def detrend(df, exclude, verbose=True):
     print("Mean log residual per 52-week block (middle far from both ends = trend bends):")
     print(blocks.to_string())
 
-    weekly.to_csv(OUT_DIR / "seasonal_trend_weekly.csv", index=False, encoding="utf-8-sig")
+    weekly.to_csv(out_dir / "seasonal_trend_weekly.csv", index=False, encoding="utf-8-sig")
 
     out = df.merge(weekly[["week", "trend"]], on="week", how="left")
     out["detrended"] = out["sales"] / out["trend"]
@@ -117,7 +121,7 @@ def detrend(df, exclude, verbose=True):
 
 
 # ---------------- step 4: pandemic check ----------------
-def pandemic_check(df):
+def pandemic_check(df, out_dir=OUT_DIR):
     level = df["detrended"].mean()
     ym = df.groupby(["year", "month", "ym"])["detrended"].mean().reset_index()
     ym["index"] = ym["detrended"] / level
@@ -140,7 +144,7 @@ def pandemic_check(df):
     ym["threshold"] = threshold
     ym["flag"] = ym["candidate"] & (ym["dev_vs_median"].abs() > threshold)
     ym = ym.drop(columns="detrended").sort_values("ym")
-    ym.to_csv(OUT_DIR / "seasonal_pandemic_check.csv", index=False, encoding="utf-8-sig")
+    ym.to_csv(out_dir / "seasonal_pandemic_check.csv", index=False, encoding="utf-8-sig")
 
     print("\nPandemic check (candidate months):")
     cand = ym[ym["candidate"]]
@@ -173,7 +177,7 @@ def group_sizes(df, key):
 
 
 # ---------------- step 5: grouping ----------------
-def compare_groupings(df, overall):
+def compare_groupings(df, overall, out_dir=OUT_DIR):
     ov = overall.set_index("month")["index"]
     rows = []
     for key in ["client", "price_band"]:
@@ -194,10 +198,10 @@ def compare_groupings(df, overall):
             "weighted_avg_max_q4_diff": wavg,
         })
         g.reset_index().to_csv(
-            OUT_DIR / f"seasonal_group_compare_{key}.csv", index=False, encoding="utf-8-sig"
+            out_dir / f"seasonal_group_compare_{key}.csv", index=False, encoding="utf-8-sig"
         )
     comp = pd.DataFrame(rows)
-    comp.to_csv(OUT_DIR / "seasonal_group_compare.csv", index=False, encoding="utf-8-sig")
+    comp.to_csv(out_dir / "seasonal_group_compare.csv", index=False, encoding="utf-8-sig")
     print(f"\nGrouping comparison (groups with >= {MIN_PRODUCTS} products, max Oct-Dec diff vs overall):")
     print(comp.round(3).to_string(index=False))
 
@@ -213,7 +217,7 @@ def compare_groupings(df, overall):
     return choice
 
 
-def client_size_report(df):
+def client_size_report(df, out_dir=OUT_DIR):
     sizes = group_sizes(df, "client").sort_values(ascending=False)
     total = sizes.sum()
     rows = []
@@ -226,12 +230,12 @@ def client_size_report(df):
             "product_coverage": kept.sum() / total,
         })
     rep = pd.DataFrame(rows)
-    rep.to_csv(OUT_DIR / "seasonal_client_size.csv", index=False, encoding="utf-8-sig")
+    rep.to_csv(out_dir / "seasonal_client_size.csv", index=False, encoding="utf-8-sig")
     print(f"\nProducts per client ({len(sizes)} clients):")
     print(rep.round(3).to_string(index=False))
 
 
-def client_year_q4_check(df):
+def client_year_q4_check(df, out_dir=OUT_DIR):
     """Per client per year: Q4 mean / Jan-Sep mean (detrended), plus top-3 product share of Q4 sales.
     High ratio every year = real seasonality. High in one year only, with high top-3 share = spike."""
     d = df.copy()
@@ -258,7 +262,7 @@ def client_year_q4_check(df):
     spread = out["ratio_max"] / out["ratio_min"]
     out["stable"] = ((out["n_years"] >= 2) & np.isfinite(spread) & (spread <= Q4_STABILITY_MAX)).astype(int)
     out = out.reset_index()
-    out.to_csv(OUT_DIR / "seasonal_client_year_q4.csv", index=False, encoding="utf-8-sig")
+    out.to_csv(out_dir / "seasonal_client_year_q4.csv", index=False, encoding="utf-8-sig")
 
     print("\nClients with Q4 ratio >= 2 in any year (ratio = Q4 mean / Jan-Sep mean; top3 = top-3 product share of Q4 sales):")
     show = out[out["ratio_max"] >= 2].sort_values("ratio_max", ascending=False)
@@ -301,38 +305,39 @@ def build_table(df, choice, overall, unstable=frozenset()):
     return pd.concat([ov, gi], ignore_index=True)
 
 
-def run(long_df, master):
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    df = prepare(long_df, master)
+def run(long_df, master, last_week=LAST_WEEK, out_dir=OUT_DIR):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = prepare(long_df, master, last_week)
     # pandemic check is judged once, on a trend fitted with no exclusion,
     # so excluding a month never changes the check itself
-    check_df, _ = detrend(df, [], verbose=False)
-    pandemic_check(check_df)
+    check_df, _ = detrend(df, [], verbose=False, out_dir=out_dir)
+    pandemic_check(check_df, out_dir=out_dir)
 
-    df, _ = detrend(df, EXCLUDE_MONTHS)
+    df, _ = detrend(df, EXCLUDE_MONTHS, out_dir=out_dir)
     if EXCLUDE_MONTHS:
         before = len(df)
         df = df[~df["ym"].isin(EXCLUDE_MONTHS)].copy()
         print(f"Pandemic months excluded {EXCLUDE_MONTHS}: {before - len(df):,} rows")
 
-    client_size_report(df)
+    client_size_report(df, out_dir=out_dir)
     overall = month_index(df, [])
     print("\nOverall monthly index:")
     print(overall[["month", "index", "years_used"]].round(3).to_string(index=False))
 
-    choice = compare_groupings(df, overall)
-    unstable = client_year_q4_check(df)
+    choice = compare_groupings(df, overall, out_dir=out_dir)
+    unstable = client_year_q4_check(df, out_dir=out_dir)
     use_unstable = unstable if (choice == "client" and APPLY_Q4_STABILITY) else set()
     table = build_table(df, choice, overall, use_unstable)
 
     table = table[["grouping", "group", "month", "index", "years_used", "n_products", "fallback", "fallback_reason"]]
     table["index"] = table["index"].round(4)
-    table.to_csv(OUT_DIR / "seasonal_index.csv", index=False, encoding="utf-8-sig")
+    table.to_csv(out_dir / "seasonal_index.csv", index=False, encoding="utf-8-sig")
 
     check = table.groupby(["grouping", "group"])["index"].agg(["count", "mean"])
     if (check["count"] != 12).any():
         print("WARNING: some groups have fewer than 12 months")
-    print(f"\nSaved: seasonal_index.csv ({len(table):,} rows) in {OUT_DIR}")
+    print(f"\nSaved: seasonal_index.csv ({len(table):,} rows) in {out_dir}")
     return table
 
 
