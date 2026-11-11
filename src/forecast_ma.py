@@ -20,12 +20,18 @@ Steps
    (ties broken by B rank, then by the shorter window).
 6. Q4 bias correction: for MA groups in BIAS_CORRECT_GROUPS, final forecast x (1 + B bias_pct)
    at the chosen n. B (2022 Q4) showed a stable under-forecast for continuous items only.
-7. Per-series error with the chosen n (population SD, so RMSE^2 = bias^2 + SD^2), in order:
-   - own_B: own B error (at least MIN_TEST_WEEKS scored weeks)
-   - own_C_scaled: own C error SD x class peak multiplier
-     (class median B ratio / class median C ratio, ratio = error SD / mean weekly forecast)
-   - class_ratio: class median B ratio x own final mean weekly forecast
+7. Per-series error with the chosen n (population SD, so RMSE^2 = bias^2 + SD^2).
+   Each source gives a ratio = error SD / mean actual sales of its own scored test weeks
+   (actual, not forecast: a forecast that missed the level would blow the ratio up), in order:
+   - own_B: own B ratio (at least MIN_TEST_WEEKS scored weeks, B mean actual > 0)
+   - own_C_scaled: own C ratio x class peak multiplier
+     (class median B ratio / class median C ratio; C mean actual > 0)
+   - class_ratio: class median B ratio
    Class = ABC x MA group; empty class falls back to the MA group, then to all series.
+   err_ratio is capped at the RATIO_CAP_QUANTILE of own_B ratios: a test period whose actual
+   sales fell far below the forecast gives a tiny denominator and an extreme ratio.
+   Error SD at the Q4 level: err_sd_q4 = err_ratio x final mean weekly forecast,
+   so the SD follows the current sales level instead of the test period's level.
 8. Write dbo.series_forecast, dbo.series_forecast_error and CSV summaries.
 
 Seasonal index: a client with fewer than 12 months before a cutoff uses the overall index.
@@ -52,6 +58,7 @@ CUTOFFS = {                       # last training week of each run
     "FINAL": LAST_WEEK,           # forecast 2023-10-02 .. 2023-12-25
 }
 MIN_TEST_WEEKS = 8                # scored weeks needed for a series' own B or C error
+RATIO_CAP_QUANTILE = 0.99         # err_ratio capped at this quantile of own_B ratios (decided 2026-11-11)
 BIAS_CORRECT_GROUPS = ["continuous"]  # decided 2026-11-10: intermittent B/C bias has opposite signs (noise)
 UNTESTABLE_SHARE_LIMIT = 0.05     # revenue share relying on class ratio; above this, revisit (option C)
 SERIES = ["client", "warehouse", "product"]
@@ -253,10 +260,12 @@ def choose_n(comp):
 
 
 def series_errors(scored, choice):
+    """Per-series error at the chosen n. Means are over the scored test weeks."""
     chosen = scored.merge(choice[["ma_group", "ma_weeks"]], on=["ma_group", "ma_weeks"], how="inner")
     e = chosen.groupby(SERIES).agg(
         err_n_weeks=("error", "size"),
         err_mean_forecast=("forecast", "mean"),
+        err_mean_actual=("sales", "mean"),
         err_rmse=("error", lambda x: float(np.sqrt(np.mean(np.square(x))))),
         err_bias=("error", "mean"),
         err_sd=("error", lambda x: float(np.std(x, ddof=0))),
@@ -265,10 +274,10 @@ def series_errors(scored, choice):
 
 
 def ratio_medians(err, groups):
-    """Median of error SD / mean weekly forecast per class, MA group and overall (testable series only)."""
+    """Median of error SD / mean actual sales per class, MA group and overall (testable series only)."""
     e = err.merge(groups[["product", "abc_class", "ma_group"]], on="product", how="left")
-    e = e[(e["err_n_weeks"] >= MIN_TEST_WEEKS) & (e["err_mean_forecast"] > 0)].copy()
-    e["ratio"] = e["err_sd"] / e["err_mean_forecast"]
+    e = e[(e["err_n_weeks"] >= MIN_TEST_WEEKS) & (e["err_mean_actual"] > 0)].copy()
+    e["ratio"] = e["err_sd"] / e["err_mean_actual"]
     by_class = e.groupby(["abc_class", "ma_group"])["ratio"].agg(["median", "size"]).reset_index()
     return by_class, e.groupby("ma_group")["ratio"].median(), e["ratio"].median()
 
@@ -293,7 +302,13 @@ def class_table(err_b, err_c, groups):
 
 
 def attach_errors(final_fc, err_b, err_c, groups):
-    """One row per series: final forecast summary + error for 3.1.2."""
+    """One row per series: final forecast summary + error for 3.1.2.
+
+    Every source becomes err_ratio (error SD / mean actual sales of its own scored test weeks);
+    err_sd_q4 = err_ratio x final mean weekly forecast (population SD at the Q4 level).
+    err_sd_n = scored weeks behind the SD (NaN for class_ratio), used by 3.1.2 for the n-1 correction.
+    err_rmse, err_bias, err_sd keep the raw 2022 Q4 values for own_B rows only.
+    """
     summ = final_fc.groupby(SERIES + ["abc_class", "ma_group", "ma_weeks"], dropna=False).agg(
         base_level=("base_level", "first"),
         window_fallback=("window_fallback", "first"),
@@ -302,24 +317,37 @@ def attach_errors(final_fc, err_b, err_c, groups):
         mean_weekly_forecast=("forecast", "mean"),
     ).reset_index()
     out = summ.merge(err_b, on=SERIES, how="left")
-    c = err_c.rename(columns={"err_n_weeks": "errC_n_weeks", "err_sd": "errC_sd"})[SERIES + ["errC_n_weeks", "errC_sd"]]
+    c = err_c.rename(columns={"err_n_weeks": "errC_n_weeks", "err_mean_forecast": "errC_mean_forecast",
+                              "err_mean_actual": "errC_mean_actual", "err_sd": "errC_sd"})[
+        SERIES + ["errC_n_weeks", "errC_mean_forecast", "errC_mean_actual", "errC_sd"]]
     out = out.merge(c, on=SERIES, how="left")
 
     t, (b_grp, b_all), (m_grp, m_all) = class_table(err_b, err_c, groups)
     out["class_ratio"] = class_lookup(out, t.rename(columns={"ratio_B": "median"}), b_grp, b_all)
     out["peak_multiplier"] = class_lookup(out, t.rename(columns={"peak_multiplier": "median"}), m_grp, m_all)
 
-    own_b = out["err_n_weeks"].fillna(0) >= MIN_TEST_WEEKS
-    own_c = ~own_b & (out["errC_n_weeks"].fillna(0) >= MIN_TEST_WEEKS) & out["peak_multiplier"].notna()
-    rest = ~own_b & ~own_c
+    own_b = (out["err_n_weeks"].fillna(0) >= MIN_TEST_WEEKS) & (out["err_mean_actual"].fillna(0) > 0)
+    own_c = (~own_b & (out["errC_n_weeks"].fillna(0) >= MIN_TEST_WEEKS)
+             & (out["errC_mean_actual"].fillna(0) > 0) & out["peak_multiplier"].notna())
     out["error_source"] = np.select([own_b, own_c], ["own_B", "own_C_scaled"], "class_ratio")
 
-    est_c = out["errC_sd"] * out["peak_multiplier"]
-    est_r = out["class_ratio"] * out["mean_weekly_forecast"]
-    for col in ["err_rmse", "err_sd"]:
-        out.loc[own_c, col] = est_c[own_c]
-        out.loc[rest, col] = est_r[rest]
-    out.loc[~own_b, "err_bias"] = np.nan
+    ratio_b = out["err_sd"] / out["err_mean_actual"].where(own_b)
+    ratio_c = out["errC_sd"] / out["errC_mean_actual"].where(own_c) * out["peak_multiplier"]
+    raw_ratio = pd.Series(np.select([own_b, own_c], [ratio_b, ratio_c], out["class_ratio"]), index=out.index)
+    cap = float(raw_ratio[own_b].quantile(RATIO_CAP_QUANTILE)) if own_b.any() else np.inf
+    out["err_ratio_raw"] = raw_ratio
+    out["err_ratio_capped"] = (raw_ratio > cap).astype(int)
+    out["err_ratio"] = raw_ratio.clip(upper=cap)
+    out.attrs["ratio_cap"] = cap
+    out["err_sd_q4"] = out["err_ratio"] * out["mean_weekly_forecast"]
+    out["err_sd_n"] = np.select([own_b, own_c], [out["err_n_weeks"], out["errC_n_weeks"]], np.nan)
+
+    # previous method (test-period units, no level scaling), kept for comparison only
+    out["err_sd_unscaled"] = np.select(
+        [own_b, own_c], [out["err_sd"], out["errC_sd"] * out["peak_multiplier"]],
+        out["class_ratio"] * out["mean_weekly_forecast"])
+
+    out.loc[~own_b, ["err_rmse", "err_bias", "err_sd"]] = np.nan
     return out, t
 
 
@@ -341,6 +369,24 @@ def source_share(err_table, long_df, groups):
         "revenue_share": g["revenue"] / g["revenue"].sum() if g["revenue"].sum() else np.nan,
     }).reindex(["own_B", "own_C_scaled", "class_ratio"]).fillna(0).reset_index()
     return res
+
+
+def scaling_report(err_table):
+    """Effect of scaling the error SD to the Q4 level, and the largest ratios to inspect."""
+    cap = err_table.attrs.get("ratio_cap", np.nan)
+    capped = err_table.groupby("error_source")["err_ratio_capped"].sum()
+    print(f"\nRatio cap = P{RATIO_CAP_QUANTILE * 100:.0f} of own_B ratios = {cap:.3f}; capped series by source:")
+    print(capped.to_string())
+    cmp = err_table.groupby("error_source")[["err_sd_unscaled", "err_sd_q4"]].sum()
+    cmp["change"] = cmp["err_sd_q4"] / cmp["err_sd_unscaled"] - 1
+    print("\nError SD summed by source, unscaled vs Q4 level (change = q4 / unscaled - 1):")
+    print(cmp.round(3).to_string())
+    print("\nError ratio (error SD / mean actual sales of the test weeks) by source:")
+    print(err_table.groupby("error_source")["err_ratio"]
+          .describe(percentiles=[0.5, 0.9, 0.99]).round(3).to_string())
+    cols = SERIES + ["error_source", "err_ratio", "mean_weekly_forecast", "err_sd_q4"]
+    print("\nLargest 10 raw error ratios (before cap):")
+    print(err_table.nlargest(10, "err_ratio_raw")[cols + ["err_ratio_raw"]].round(3).to_string(index=False))
 
 
 def bias_factors(comp, choice):
@@ -399,8 +445,9 @@ def pipeline(long_df, strategy, index_by_cutoff):
     rs = share.loc[share["error_source"] == "class_ratio", "revenue_share"].sum()
     if rs > UNTESTABLE_SHARE_LIMIT:
         print(f"NOTE: revenue share on class ratio {rs:.1%} > {UNTESTABLE_SHARE_LIMIT:.0%}")
-    print("\nClass table (ratio = error SD / mean weekly forecast; peak multiplier = ratio_B / ratio_C):")
+    print("\nClass table (ratio = error SD / mean actual sales; peak multiplier = ratio_B / ratio_C):")
     print(by_class.round(3).to_string(index=False))
+    scaling_report(err_table)
 
     return {"comp": comp, "choice": choice, "factors": factors, "final_fc": final_fc,
             "err_table": err_table, "by_class": by_class, "share": share}
@@ -533,6 +580,22 @@ def selftest():
     def err_of(prod, col):
         return et[et["product"] == prod][col].iloc[0]
 
+    # unit check: B forecast 0 but sales > 0 must stay own_B with a finite ratio (ratio uses actual)
+    key = {"client": 9, "warehouse": 0, "product": 901}
+    ffc = pd.DataFrame([{**key, "abc_class": "A", "ma_group": "continuous", "ma_weeks": 4, "base_level": 50.0,
+                         "window_fallback": False, "bias_factor": 1.0, "forecast": 50.0}])
+    eb = pd.DataFrame([{**key, "err_n_weeks": 13, "err_mean_forecast": 0.0, "err_mean_actual": 20.0,
+                        "err_rmse": 22.0, "err_bias": 20.0, "err_sd": float(np.sqrt(22.0 ** 2 - 20.0 ** 2))}])
+    gr = pd.DataFrame({"product": [901], "abc_class": ["A"], "ma_group": ["continuous"]})
+    zt, _ = attach_errors(ffc, eb, eb.iloc[0:0].copy(), gr)
+    zero_fc_ok = (zt["error_source"].iloc[0] == "own_B"
+                  and abs(zt["err_sd_q4"].iloc[0] - eb["err_sd"].iloc[0] / 20.0 * 50.0) < 1e-9)
+
+    cap = et.attrs["ratio_cap"]
+    ob = et[et["error_source"] == "own_B"]
+    oc = et[et["error_source"] == "own_C_scaled"]
+    cr = et[et["error_source"] == "class_ratio"]
+
     checks = [
         ("continuous n = 4 (level shift favors short window, ties go to shorter)", n_c == 4),
         ("intermittent n is a candidate", n_i in MA_CANDIDATES),
@@ -545,16 +608,32 @@ def selftest():
         ("102 stockout week excluded: Dec forecast = 20 x 1.3 x factor", abs(fc_at(102, dec) - 26.0 * f_c) < 1e-9),
         ("103 after shift: Dec forecast = 15 x 1.3 x factor", abs(fc_at(103, dec) - 19.5 * f_c) < 1e-9),
         ("105 launched between B and C -> own_C_scaled", err_of(105, "error_source") == "own_C_scaled"),
-        ("105 error SD finite", np.isfinite(err_of(105, "err_sd"))),
+        ("105 Q4 error SD finite and > 0", np.isfinite(err_of(105, "err_sd_q4")) and err_of(105, "err_sd_q4") > 0),
         ("108 launched after C -> class_ratio", err_of(108, "error_source") == "class_ratio"),
-        ("108 error SD = class ratio x mean weekly forecast",
-         abs(err_of(108, "err_sd") - err_of(108, "class_ratio") * err_of(108, "mean_weekly_forecast")) < 1e-9),
         ("106 not replenished -> no forecast", (fc["product"] == 106).sum() == 0),
         ("107 window fallback used, base = 8", bool(err_of(107, "window_fallback")) and abs(err_of(107, "base_level") - 8) < 1e-9),
-        ("RMSE^2 = bias^2 + SD^2 for own_B",
-         np.allclose(et.loc[et["error_source"] == "own_B", "err_rmse"] ** 2,
-                     et.loc[et["error_source"] == "own_B", "err_bias"] ** 2
-                     + et.loc[et["error_source"] == "own_B", "err_sd"] ** 2)),
+        ("104 noisy full history -> own_B with SD > 0", err_of(104, "error_source") == "own_B" and err_of(104, "err_sd") > 0),
+        ("RMSE^2 = bias^2 + SD^2 for own_B (raw 2022 Q4 values)",
+         np.allclose(ob["err_rmse"] ** 2, ob["err_bias"] ** 2 + ob["err_sd"] ** 2)),
+        ("own_B: err_sd_q4 = err_sd / B mean actual x Q4 mean weekly forecast",
+         np.allclose(ob["err_sd_q4"], (ob["err_sd"] / ob["err_mean_actual"]).clip(upper=cap) * ob["mean_weekly_forecast"])),
+        ("own_C_scaled: err_sd_q4 = C SD / C mean actual x peak multiplier x Q4 mean weekly forecast",
+         np.allclose(oc["err_sd_q4"],
+                     (oc["errC_sd"] / oc["errC_mean_actual"] * oc["peak_multiplier"]).clip(upper=cap)
+                     * oc["mean_weekly_forecast"])),
+        ("ratio uses actual, not forecast: zero B forecast with sales stays own_B", zero_fc_ok),
+        ("class_ratio: err_sd_q4 = class ratio x Q4 mean weekly forecast",
+         np.allclose(cr["err_sd_q4"], cr["class_ratio"] * cr["mean_weekly_forecast"])),
+        ("err_sd_n: own_B = B weeks, own_C = C weeks, class_ratio = NaN",
+         np.allclose(ob["err_sd_n"], ob["err_n_weeks"]) and np.allclose(oc["err_sd_n"], oc["errC_n_weeks"])
+         and cr["err_sd_n"].isna().all()),
+        ("raw own-B columns are NaN outside own_B",
+         et.loc[et["error_source"] != "own_B", ["err_rmse", "err_bias", "err_sd"]].isna().all().all()),
+        ("err_sd_q4 has no missing value", et["err_sd_q4"].notna().all()),
+        ("err_ratio never above the cap, capped flag matches", (et["err_ratio"] <= cap + 1e-12).all()
+         and (et["err_ratio_capped"] == (et["err_ratio_raw"] > cap).astype(int)).all()),
+        ("cap = own_B ratio quantile", abs(cap - et.loc[et["error_source"] == "own_B", "err_ratio_raw"]
+                                           .quantile(RATIO_CAP_QUANTILE)) < 1e-12),
     ]
 
     # seasonal_index.run with an earlier cutoff must not use later weeks
