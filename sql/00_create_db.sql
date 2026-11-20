@@ -1,4 +1,4 @@
--- Create the project database (skipped if it already exists, safe to rerun)
+-- 1.1.1 Environment setup and data loading: create the project database (skipped if it already exists, safe to rerun)
 -- The name is passed in by Python from SQL_DATABASE in .env
 DECLARE @db sysname = ?;
 DECLARE @sql nvarchar(max) = N'CREATE DATABASE ' + QUOTENAME(@db);
