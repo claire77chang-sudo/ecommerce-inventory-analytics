@@ -24,7 +24,7 @@ import pandas as pd
 from linearmodels.panel import PanelOLS
 
 # ---------------------------------------------------------------- parameters
-PRICE_BANDS = ["30-60", "100-1000"]   # top 2 bands by revenue (step 1)
+PRICE_BANDS = ["30-60", "100-1000", "15-30", "60-100"]   # top 4 bands by revenue (91.4%)
 MODELS = ["main", "no_week", "plus1"]
 ALPHA = 0.05                          # significance level
 ELASTIC_THRESHOLD = -1.0              # CI entirely below -1 = elastic
@@ -36,6 +36,9 @@ IF_EXISTS = "replace"
 SIM_TRUE_ELASTICITY = -1.5
 SIM_TOLERANCE = 0.10                  # main estimate must be within +-0.10 of truth
 SIM_SEED = 42
+SIM_BAND_PRICE_RANGE = {             # simulated base price range per band
+    "15-30": (15, 30), "30-60": (30, 60), "60-100": (60, 100), "100-1000": (100, 1000),
+}
 
 
 # ---------------------------------------------------------------- load
@@ -258,7 +261,8 @@ def simulate():
     t = np.arange(len(weeks))
     season = 0.6 * np.sin(2 * np.pi * t / 52)
     recs = []
-    for band, base_lo, base_hi in [("30-60", 30, 60), ("100-1000", 100, 1000)]:
+    for band in PRICE_BANDS:
+        base_lo, base_hi = SIM_BAND_PRICE_RANGE[band]
         for p in range(300):
             product = f"{band}_{p}"
             dup_keep = 0 if p < 5 else 1

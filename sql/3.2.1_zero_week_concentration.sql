@@ -1,5 +1,5 @@
 /*
-  zero_week_concentration.sql
+  3.2.1_zero_week_concentration.sql
   WBS 3.2.1 Price band elasticity - Step 5.1 zero-sales week source check
 
   Purpose:
@@ -8,7 +8,7 @@
 
   Population (same as zero_share in price_elasticity.py):
     - dbo.phase0_long (Phase 0 only, leading zeros already removed)
-    - price_band IN ('30-60', '100-1000')
+    - price_band IN ('30-60', '100-1000', '15-30', '60-100')
     - price_suspect = 0, regular_price IS NOT NULL, dup_keep = 1
     - suspected_stockout = 1 excluded (NULL kept)
     - NO price filter (zero-sales weeks have no price by design)
@@ -39,7 +39,7 @@ INTO #series
 FROM dbo.phase0_long AS l
 JOIN dbo.product_master AS m
     ON m.product = l.product
-WHERE m.price_band IN ('30-60', '100-1000')
+WHERE m.price_band IN ('30-60', '100-1000', '15-30', '60-100')
   AND m.price_suspect = 0
   AND m.regular_price IS NOT NULL
   AND m.dup_keep = 1
