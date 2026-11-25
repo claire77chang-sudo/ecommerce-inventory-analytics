@@ -46,8 +46,8 @@ FULFILLMENT_FEE_PER_UNIT = 3.06
 DELTAS = [round(x / 100, 2) for x in range(-5, 6)]       # -5% .. +5%, step 1%
 ELASTICITY_MODEL = "main"
 EXPECTED_COST_RATIO = {                                   # 1.2.2 cost / revenue by band
-    "15-30": 0.411, "30-60": 0.481, "60-100": 0.512, "100-1000": 0.537,
-}
+    "15-30": 0.421, "30-60": 0.476, "60-100": 0.510, "100-1000": 0.533,
+}                                                         # updated 2026-11-25: sales-weighted cost base
 COST_RATIO_TOLERANCE = 0.0006                             # 1.2.2 values are rounded to 0.1%
 OUTPUT_TABLE = "price_scenario"
 OUTPUT_CSV = Path("outputs") / "price_scenario_summary.csv"

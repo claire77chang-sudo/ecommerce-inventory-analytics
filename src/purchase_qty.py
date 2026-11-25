@@ -197,9 +197,9 @@ def compute_purchase(series_rop, forecast, inventory, strategy, cost):
     series = pd.concat([rep[cols], extra[cols]], ignore_index=True)
 
     # --- cost ---------------------------------------------------------------
-    c = cost[["product", "regular_price", "cogs_rate"]].copy()
-    c["unit_cost"] = c["regular_price"] * c["cogs_rate"]
-    series = series.merge(c[["product", "unit_cost"]], on="product", how="left")
+    # unit_cost is read directly: since 2026-11-25 the 1.2.2 cost base is the
+    # sales-weighted price, not product_cost.regular_price
+    series = series.merge(cost[["product", "unit_cost"]], on="product", how="left")
     series["purchase_cost"] = series["purchase_qty"] * series["unit_cost"]
     series["init_inv_cost"] = series["init_inv"] * series["unit_cost"]
     series["excess_cost"] = series["excess_units"] * series["unit_cost"]
@@ -270,7 +270,7 @@ def run():
     strategy = pd.read_sql(
         "SELECT product, strategy_class, abc_class, replenish FROM dbo.product_strategy", engine)
     cost = pd.read_sql(
-        "SELECT product, regular_price, cogs_rate FROM dbo.product_cost", engine)
+        "SELECT product, unit_cost FROM dbo.product_cost", engine)
     forecast["week"] = pd.to_datetime(forecast["week"])
 
     first_week = forecast["week"].min()
@@ -422,7 +422,7 @@ def selftest():
         + [dict(product="d1", strategy_class="discontinued", abc_class="C", replenish=0),
            dict(product="d2", strategy_class="discontinued", abc_class="C", replenish=0),
            dict(product="d3", strategy_class="duplicate", abc_class="D", replenish=0)])
-    cost = pd.DataFrame([dict(product=p, regular_price=10.0, cogs_rate=0.5)
+    cost = pd.DataFrame([dict(product=p, unit_cost=5.0)
                          for p in list(strategy["product"])])
 
     series, product = compute_purchase(series_rop, forecast, inventory, strategy, cost)
@@ -469,7 +469,7 @@ def selftest():
     p1 = product.set_index("product").loc["p1"]
     expected_p1 = s.loc[("p1", 10), "purchase_qty"] + s.loc[("p1", 11), "purchase_qty"]
     check("Product purchase qty = sum of series", p1["purchase_qty"] == expected_p1)
-    check("Purchase cost = qty x price x cogs rate",
+    check("Purchase cost = qty x unit_cost",
           abs(s.loc[("p1", 10), "purchase_cost"] - 280 * 5.0) < 1e-9)
 
     # Error cases
