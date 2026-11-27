@@ -28,14 +28,19 @@ Demand (--demand-source, default phase1_actual):
   - Series in the source but not simulated -> ignored (count printed)
   - Add a new source (e.g. an imputed table from 4.11) to DEMAND_SOURCES
 
-Outputs (written only if all checks pass; rows of the same demand_source and
+Scenario (--scenario, default base; added for 3.4.4 robustness.py):
+  - Label only; the scenario's inputs are prepared by robustness.py before this runs
+  - Existing tables without a scenario column get one, old rows labelled base
+
+Outputs (written only if all checks pass; rows of the same scenario, demand_source and
 init_inv are replaced, other runs are kept):
   dbo.backtest_result : approach x abc_group (ALL / A / B / C), 8 rows per run
   dbo.backtest_series : series x approach detail
 
 Usage:
   python src/backtest.py                              # phase1_actual, init_inv_base
-  python src/backtest.py --init-inv init_inv_narrow   # 3.4.4 sensitivity
+  python src/backtest.py --init-inv init_inv_narrow   # initial inventory column
+  python src/backtest.py --scenario cost_40           # label set by robustness.py (3.4.4)
   python src/backtest.py --selftest                   # simulated data, no database
 """
 
@@ -64,6 +69,8 @@ DEMAND_SOURCES = {"phase1_actual": [("raw:sales_p0", "sales", "2023-10-02", "202
 DEFAULT_DEMAND_SOURCE = "phase1_actual"
 INIT_INV_COLS = ["init_inv_base", "init_inv_narrow", "init_inv_wide"]
 DEFAULT_INIT_INV = "init_inv_base"
+DEFAULT_SCENARIO = "base"
+SCENARIO_SQL_TYPE = "NVARCHAR(50)"
 
 EXPECTED_N_SERIES = 14_734                   # simulated series in 3.3.3
 EXPECTED_RAW_SERIES = {"raw:sales_p0": 15_053}   # rows of the raw file (load_raw.py check)
@@ -75,7 +82,7 @@ SERIES_TABLE = "backtest_series"
 METRIC_COLUMNS = ["stockout_rate", "weeks_of_supply", "gmroi", "gmroi_2pt", "total_demand",
                   "total_sales", "total_lost", "total_order_cost",
                   "total_post_q4_arrival_cost", "total_ending_inv_cost"]   # same as 3.3.3
-RESULT_COLUMNS = (["approach", "abc_group", "demand_source", "init_inv", "n_series"]
+RESULT_COLUMNS = (["scenario", "approach", "abc_group", "demand_source", "init_inv", "n_series"]
                   + METRIC_COLUMNS + ["lost_margin"])
 ADDITIVE_COLUMNS = ["n_series", "total_demand", "total_sales", "total_lost", "total_order_cost",
                     "total_post_q4_arrival_cost", "total_ending_inv_cost", "lost_margin"]
@@ -149,7 +156,8 @@ def abc_map(kept, product_abc):
     return a
 
 
-def prepare(d, demand_source=DEFAULT_DEMAND_SOURCE, init_inv_col=DEFAULT_INIT_INV):
+def prepare(d, demand_source=DEFAULT_DEMAND_SOURCE, init_inv_col=DEFAULT_INIT_INV,
+            scenario=DEFAULT_SCENARIO):
     """Build simulate() inputs and coverage info from the raw tables in dict d."""
     if demand_source not in DEMAND_SOURCES:
         raise ValueError(f"Unknown demand_source {demand_source!r}, use {list(DEMAND_SOURCES)}")
@@ -186,7 +194,8 @@ def prepare(d, demand_source=DEFAULT_DEMAND_SOURCE, init_inv_col=DEFAULT_INIT_IN
     return dict(series=sel["series"], init_inv=sel["init_inv"], orders=orders,
                 dropped=dropped, demand=demand, lead_time=d["product_lead_time"],
                 cost=sel["cost"], cm_source=sel["cm_source"], abc=abc, coverage=coverage,
-                demand_source=demand_source, init_inv_col=init_inv_col, table=table)
+                demand_source=demand_source, init_inv_col=init_inv_col, table=table,
+                scenario=scenario)
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +212,8 @@ def run_backtest(p):
         for g in GROUPS:
             part = ss if g == "ALL" else ss[ss["abc_class"] == g]
             m = sim.summarize(part).iloc[0].to_dict()
-            rows.append({"approach": a, "abc_group": g, "demand_source": p["demand_source"],
+            rows.append({"scenario": p["scenario"], "approach": a, "abc_group": g,
+                         "demand_source": p["demand_source"],
                          "init_inv": p["init_inv_col"], **m,
                          "lost_margin": float(part["lost_margin"].sum())})
         details.append(ss.assign(approach=a))
@@ -211,8 +221,9 @@ def run_backtest(p):
     res = pd.DataFrame(rows)[RESULT_COLUMNS]
     res["n_series"] = res["n_series"].astype(int)
     series = pd.concat(details, ignore_index=True)
-    lead = ["approach", "demand_source", "init_inv_source"] + KEYS + ["abc_class"]
-    series = series.assign(demand_source=p["demand_source"], init_inv_source=p["init_inv_col"])
+    lead = ["scenario", "approach", "demand_source", "init_inv_source"] + KEYS + ["abc_class"]
+    series = series.assign(scenario=p["scenario"], demand_source=p["demand_source"],
+                           init_inv_source=p["init_inv_col"])
     series = series[lead + [c for c in series.columns if c not in lead]]
     return res, series
 
@@ -268,7 +279,8 @@ def report(res, p, benefit, chk):
     pd.set_option("display.width", 240)
     pd.set_option("display.max_columns", 30)
     s, cv = p["series"], p["coverage"]
-    print(f"\nDemand source: {p['demand_source']} ({p['table']}) | init_inv: {p['init_inv_col']}")
+    print(f"\nScenario: {p['scenario']} | Demand source: {p['demand_source']} ({p['table']}) "
+          f"| init_inv: {p['init_inv_col']}")
 
     print("\n=== Series ===")
     print(f"series_inventory rows      : {len(s):,}")
@@ -306,7 +318,8 @@ def report(res, p, benefit, chk):
     fmt = {"stockout_rate": "{:.2%}".format, "weeks_of_supply": "{:.2f}".format,
            "gmroi": "{:.3f}".format, "gmroi_2pt": "{:.3f}".format,
            **{c: "{:,.0f}".format for c in METRIC_COLUMNS[4:] + ["lost_margin"]}}
-    print(res.drop(columns=["demand_source", "init_inv"]).to_string(index=False, formatters=fmt))
+    print(res.drop(columns=["scenario", "demand_source", "init_inv"])
+          .to_string(index=False, formatters=fmt))
 
     print("\n=== 3.3.3 estimate vs this backtest (ALL) ===")
     cols = ["approach", "demand_source"] + METRIC_COLUMNS
@@ -332,9 +345,10 @@ def report(res, p, benefit, chk):
 # Main flow (shared by database run and self test)
 # ---------------------------------------------------------------------------
 def execute(d, demand_source=DEFAULT_DEMAND_SOURCE, init_inv_col=DEFAULT_INIT_INV,
-            expected_n=EXPECTED_N_SERIES, writer=None, expected_raw=EXPECTED_RAW_SERIES):
+            expected_n=EXPECTED_N_SERIES, writer=None, expected_raw=EXPECTED_RAW_SERIES,
+            scenario=DEFAULT_SCENARIO):
     """Prepare, simulate, check, report; call writer(res, series) only if all checks pass."""
-    p = prepare(d, demand_source, init_inv_col)
+    p = prepare(d, demand_source, init_inv_col, scenario)
     print("Running 2 simulations ...")
     res, series = run_backtest(p)
     chk = checks(res, p, d["benefit_estimate"], expected_n, expected_raw)
@@ -380,39 +394,56 @@ def load(engine, demand_source, init_inv_col):
     }
 
 
+def ensure_scenario_column(engine):
+    """Add a scenario column to existing output tables; old rows are labelled base."""
+    from sqlalchemy import inspect, text
+    for table in (RESULT_TABLE, SERIES_TABLE):
+        if not inspect(engine).has_table(table, schema="dbo"):
+            continue
+        with engine.begin() as conn:
+            has = conn.execute(text(f"SELECT COL_LENGTH('dbo.{table}', 'scenario')")).scalar()
+            if has is None:
+                conn.execute(text(f"ALTER TABLE dbo.{table} ADD scenario {SCENARIO_SQL_TYPE} NULL"))
+                n = conn.execute(text(f"UPDATE dbo.{table} SET scenario = :s "
+                                      f"WHERE scenario IS NULL"), {"s": DEFAULT_SCENARIO}).rowcount
+                print(f"dbo.{table}: added scenario column, {n:,} existing rows set to "
+                      f"{DEFAULT_SCENARIO}")
+
+
 def make_writer(engine):
     from sqlalchemy import inspect, text
 
     def replace_run(df, table):
-        """Delete rows of this demand_source / init_inv run, then append."""
+        """Delete rows of this scenario / demand_source / init_inv run, then append."""
         run_col = "init_inv" if table == RESULT_TABLE else "init_inv_source"
-        ds, ii = df["demand_source"].iloc[0], df[run_col].iloc[0]
+        sc, ds, ii = df["scenario"].iloc[0], df["demand_source"].iloc[0], df[run_col].iloc[0]
+        where = f"WHERE scenario = :sc AND demand_source = :ds AND {run_col} = :ii"
+        prm = {"sc": sc, "ds": ds, "ii": ii}
         if inspect(engine).has_table(table, schema="dbo"):
             with engine.begin() as conn:
-                conn.execute(text(f"DELETE FROM dbo.{table} "
-                                  f"WHERE demand_source = :ds AND {run_col} = :ii"),
-                             {"ds": ds, "ii": ii})
+                conn.execute(text(f"DELETE FROM dbo.{table} {where}"), prm)
         df.to_sql(table, engine, schema="dbo", if_exists="append", index=False, chunksize=10_000)
-        n_db = pd.read_sql(text(f"SELECT COUNT(*) AS n FROM dbo.{table} "
-                                f"WHERE demand_source = :ds AND {run_col} = :ii"),
-                           engine, params={"ds": ds, "ii": ii})["n"].iloc[0]
+        n_db = pd.read_sql(text(f"SELECT COUNT(*) AS n FROM dbo.{table} {where}"),
+                           engine, params=prm)["n"].iloc[0]
         if n_db != len(df):
             raise ValueError(f"dbo.{table}: wrote {len(df)} rows, found {n_db}")
-        print(f"Wrote dbo.{table}: {n_db:,} rows for {ds} / {ii} (verified)")
+        print(f"Wrote dbo.{table}: {n_db:,} rows for {sc} / {ds} / {ii} (verified)")
 
     def writer(res, series):
         print()
+        ensure_scenario_column(engine)
         replace_run(res, RESULT_TABLE)
         replace_run(series, SERIES_TABLE)
     return writer
 
 
-def run(demand_source, init_inv_col):
+def run(demand_source, init_inv_col, scenario=DEFAULT_SCENARIO):
     from to_long import get_engine  # project helper
     engine = get_engine()
-    print(f"Loading inputs ({demand_source}, {init_inv_col}) ...")
+    print(f"Loading inputs ({scenario}, {demand_source}, {init_inv_col}) ...")
     d = load(engine, demand_source, init_inv_col)
-    execute(d, demand_source, init_inv_col, EXPECTED_N_SERIES, writer=make_writer(engine))
+    execute(d, demand_source, init_inv_col, EXPECTED_N_SERIES, writer=make_writer(engine),
+            scenario=scenario)
 
 
 # ---------------------------------------------------------------------------
@@ -582,8 +613,9 @@ def selftest():
     check("All checks pass on test data, writer called once with 8 + 8 rows",
           all(ok for _, ok, _ in chk) and len(written) == 1
           and len(written[0][0]) == 8 and len(written[0][1]) == 8)
-    check("Series detail: demand_source / init_inv_source labels and abc_class",
-          (series["demand_source"] == "phase1_actual").all()
+    check("Series detail: scenario / demand_source / init_inv_source labels and abc_class",
+          (series["scenario"] == "base").all() and (res["scenario"] == "base").all()
+          and (series["demand_source"] == "phase1_actual").all()
           and (series["init_inv_source"] == "init_inv_base").all()
           and series["abc_class"].notna().all())
     blocked("Wrong expected series count blocks writing", d, expected_n=5)
@@ -607,8 +639,10 @@ def selftest():
           not tchk[f"[baseline] A + B + C = ALL ({len(ADDITIVE_COLUMNS)} additive columns)"])
 
     print("Parameters:")
-    rn, _, _ = execute(d, init_inv_col="init_inv_narrow", expected_n=4,
-                       expected_raw=TEST_RAW)
+    rn, sn, _ = execute(d, init_inv_col="init_inv_narrow", expected_n=4,
+                        expected_raw=TEST_RAW, scenario="n_narrow")
+    check("--scenario label recorded in result and series detail",
+          (rn["scenario"] == "n_narrow").all() and (sn["scenario"] == "n_narrow").all())
     rn = rn.set_index(["approach", "abc_group"])
     # A init 0, order 100 L2: lost 24 in wk 0..1, wk2..9 sell 96, wk10 sell 4 lost 8,
     # wk11..12 lost 24 -> sales 100, lost 56 (was 36)
@@ -649,7 +683,9 @@ if __name__ == "__main__":
                         choices=list(DEMAND_SOURCES), help="demand table (default phase1_actual)")
     parser.add_argument("--init-inv", default=DEFAULT_INIT_INV, choices=INIT_INV_COLS,
                         help="series_inventory column for initial inventory")
+    parser.add_argument("--scenario", default=DEFAULT_SCENARIO,
+                        help="scenario label for 3.4.4 robustness runs (default base)")
     args = parser.parse_args()
     if args.selftest:
         sys.exit(0 if selftest() else 1)
-    run(args.demand_source, args.init_inv)
+    run(args.demand_source, args.init_inv, args.scenario)
