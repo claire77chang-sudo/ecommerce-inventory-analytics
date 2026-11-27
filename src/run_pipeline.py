@@ -1,5 +1,6 @@
 """
-WBS 3.5.1 one-command rerun of the whole analysis (to_long -> robustness).
+WBS 3.5.1 one-command rerun of the whole analysis (to_long -> export_report).
+export_report (3.5.2 Excel report) added as step 24 on 2026-11-27.
 
 Runs every program in STEPS in order with `python src/<step>.py`, one subprocess each,
 from the repo root. Existing programs are not changed; the order lives only in STEPS.
@@ -25,7 +26,7 @@ Outputs (outputs/pipeline/):
 
 Usage:
   python src/run_pipeline.py                    # full rerun from to_long
-  python src/run_pipeline.py --from forecast_ma # from forecast_ma to robustness
+  python src/run_pipeline.py --from forecast_ma # from forecast_ma to export_report
   python src/run_pipeline.py --list             # print the step order
   python src/run_pipeline.py --selftest         # fake programs, no database
 """
@@ -75,6 +76,7 @@ STEPS = [
     "benefit_estimate",
     "backtest",
     "robustness",
+    "export_report",
 ]
 
 # Steps that cannot be a --from start, with the step to start from instead
@@ -242,22 +244,24 @@ def selftest():
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + ("" if cond else f"  {detail}"))
 
     print("Step list")
-    check("23 steps, no duplicates", len(STEPS) == 23 and len(set(STEPS)) == 23, len(STEPS))
-    check("to_long first, robustness last", STEPS[0] == "to_long" and STEPS[-1] == "robustness")
+    check("24 steps, no duplicates", len(STEPS) == 24 and len(set(STEPS)) == 24, len(STEPS))
+    check("to_long first, export_report last, robustness right before it",
+          STEPS[0] == "to_long" and STEPS[-1] == "export_report" and STEPS[-2] == "robustness")
     check("baseline_purchase before budget_allocation",
           STEPS.index("baseline_purchase") < STEPS.index("budget_allocation"))
     check("clean_check right after to_long", STEPS.index("clean_check") == 1)
     check("inventory_sim not a step", "inventory_sim" not in STEPS)
-    check("all 23 programs exist in src/", not missing_programs(STEPS, SRC_DIR),
+    check("all 24 programs exist in src/", not missing_programs(STEPS, SRC_DIR),
           missing_programs(STEPS, SRC_DIR))
 
     print("--from parsing")
-    check("no --from -> all 23", select_steps(STEPS) == STEPS)
-    check("--from to_long -> all 23", select_steps(STEPS, "to_long") == STEPS)
+    check("no --from -> all 24", select_steps(STEPS) == STEPS)
+    check("--from to_long -> all 24", select_steps(STEPS, "to_long") == STEPS)
     sel = select_steps(STEPS, "forecast_ma")
-    check("--from forecast_ma -> 11 steps, forecast_ma..robustness",
-          len(sel) == 11 and sel[0] == "forecast_ma" and sel[-1] == "robustness", sel)
-    check("--from robustness -> 1 step", select_steps(STEPS, "robustness") == ["robustness"])
+    check("--from forecast_ma -> 12 steps, forecast_ma..export_report",
+          len(sel) == 12 and sel[0] == "forecast_ma" and sel[-1] == "export_report", sel)
+    check("--from robustness -> 2 steps", select_steps(STEPS, "robustness") == ["robustness", "export_report"])
+    check("--from export_report -> 1 step", select_steps(STEPS, "export_report") == ["export_report"])
     for bad, word in [("clean_check", "to_long"), ("nope", "unknown"), ("inventory_sim", "unknown")]:
         try:
             select_steps(STEPS, bad)
@@ -353,7 +357,7 @@ def selftest():
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="WBS 3.5.1 one-command rerun (to_long -> robustness)")
+    parser = argparse.ArgumentParser(description="WBS 3.5.1 one-command rerun (to_long -> export_report)")
     parser.add_argument("--from", dest="start", metavar="STEP",
                         help="start from this step and run to the end")
     parser.add_argument("--list", action="store_true", help="print the step order and exit")
