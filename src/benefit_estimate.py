@@ -20,6 +20,7 @@ Preprocessing:
     product_gmroi get gmroi.unit_cm(P0 price, unit_cost), P0 price as in gmroi.py.
     If a product has no valid P0 price, product_master.regular_price is used.
     Series still without unit_cm are excluded as no_price (reported).
+  - select_series() and build_orders() are reused by backtest.py (3.4.3).
 
 Inputs : dbo.series_inventory, dbo.series_forecast, dbo.series_budget_purchase,
          dbo.series_baseline_purchase, dbo.product_lead_time, dbo.product_cost,
@@ -132,15 +133,21 @@ def to_orders(purchase, qty_col, kept):
     return o[KEYS + ["order_week", "qty"]].reset_index(drop=True), dropped
 
 
-def prepare(d):
-    """Build simulate() inputs from the raw tables in dict d."""
+def select_series(d, init_inv_col=INIT_INV_COL, extra_cols=()):
+    """
+    Series selection shared with backtest.py (3.4.3):
+    exclusion (duplicate > price_suspect > no_cost, then no_price), unit_cm priority,
+    init_inv_col renamed to init_inv.
+    Returns dict(series, kept, init_inv, cost, cm_source).
+    """
     sim._check_unique(d["series_inventory"], KEYS, "series_inventory")
     for name in ["product_master", "product_cost", "product_gmroi"]:
         sim._check_unique(d[name], ["product"], name)
 
-    s = d["series_inventory"][KEYS + ["avg_weekly_sales", INIT_INV_COL]].copy()
-    if s[["avg_weekly_sales", INIT_INV_COL]].isna().any().any():
-        raise ValueError("series_inventory: missing avg_weekly_sales or init_inv_base")
+    need = list(extra_cols) + [init_inv_col]
+    s = d["series_inventory"][KEYS + need].copy()
+    if s[need].isna().any().any():
+        raise ValueError(f"series_inventory: missing {' or '.join(need)}")
     s["exclude_reason"] = exclusion_reason(s, d["product_master"], d["product_cost"])
 
     cost = unit_cm_table(s["product"], d["product_gmroi"], d["product_cost"],
@@ -149,18 +156,29 @@ def prepare(d):
     s.loc[s["exclude_reason"].isna() & (s["cm_source"] == "missing"), "exclude_reason"] = "no_price"
 
     kept = s[s["exclude_reason"].isna()].reset_index(drop=True)
-    init_inv = kept[KEYS + [INIT_INV_COL]].rename(columns={INIT_INV_COL: "init_inv"})
+    init_inv = kept[KEYS + [init_inv_col]].rename(columns={init_inv_col: "init_inv"})
+    used = cost[cost["product"].isin(kept["product"])].copy()
+    return dict(series=s, kept=kept, init_inv=init_inv,
+                cost=used[["product", "unit_cost", "unit_cm"]], cm_source=used)
 
+
+def build_orders(d, kept):
+    """Week-0 orders per approach on kept series. Returns (orders, dropped) dicts."""
     orders, dropped = {}, {}
     for name, (table, col) in APPROACHES.items():
         orders[name], dropped[name] = to_orders(d[table], col, kept)
+    return orders, dropped
 
+
+def prepare(d):
+    """Build simulate() inputs from the raw tables in dict d."""
+    sel = select_series(d, INIT_INV_COL, extra_cols=["avg_weekly_sales"])
+    orders, dropped = build_orders(d, sel["kept"])
     demand = {"forecast": forecast_demand(d["series_forecast"]),
-              "q3_avg": q3_avg_demand(kept)}
-    used = cost[cost["product"].isin(kept["product"])].copy()
-    return dict(series=s, init_inv=init_inv, orders=orders, dropped=dropped, demand=demand,
-                lead_time=d["product_lead_time"], cost=used[["product", "unit_cost", "unit_cm"]],
-                cm_source=used)
+              "q3_avg": q3_avg_demand(sel["kept"])}
+    return dict(series=sel["series"], init_inv=sel["init_inv"], orders=orders, dropped=dropped,
+                demand=demand, lead_time=d["product_lead_time"], cost=sel["cost"],
+                cm_source=sel["cm_source"])
 
 
 def run_all(p):
