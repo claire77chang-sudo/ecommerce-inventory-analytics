@@ -144,7 +144,7 @@ def run_steps(steps, src_dir, out_dir, python=sys.executable, cwd=ROOT, number_f
         failed = rc != 0 or bool(FAIL_PATTERN.search(text))
         reason = "" if not failed else (f"exit code {rc}" if rc != 0 else "FAIL found in log")
         results.append({"step_no": i, "step": step, "status": "FAIL" if failed else "ok",
-                        "seconds": round(secs, 1), "exit_code": rc, "reason": reason,
+                        "seconds": round(secs, 1), "raw_seconds": secs, "exit_code": rc, "reason": reason,
                         "log": str(log)})
         print(f"  [{'FAIL' if failed else ' ok '}] {i:02d} {step:<{width}}  {secs:7.1f}s", flush=True)
         if failed:
@@ -167,7 +167,7 @@ def summarize(results, total_secs, planned):
     print(f"{'#':>3}  {'step':<{width}}  {'status':<6}  {'seconds':>8}  {'share':>6}")
     print("-" * (width + 30))
     for r in results:
-        share = r["seconds"] / total_secs if total_secs else 0
+        share = r["raw_seconds"] / total_secs if total_secs else 0
         print(f"{r['step_no']:>3}  {r['step']:<{width}}  {r['status']:<6}  "
               f"{r['seconds']:>8.1f}  {share:>6.1%}")
     print("-" * (width + 30))
@@ -183,7 +183,7 @@ def write_csv(results, out_dir, run_start, total_secs, start_step):
     cols = ["run_start", "from_step", "step_no", "step", "status", "seconds", "exit_code",
             "reason", "log"]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for r in results:
             w.writerow({"run_start": f"{run_start:%Y-%m-%d %H:%M:%S}", "from_step": start_step, **r})
@@ -300,6 +300,7 @@ def selftest():
               and float(rows[-1]["seconds"]) >= sum(float(r["seconds"]) for r in rows[:-1]) - 0.15,
               rows)
         check("'FAILED_CASES' / 'PASSED' not treated as FAIL", rows and rows[2]["status"] == "ok")
+        check("CSV has no raw_seconds column", rows and "raw_seconds" not in rows[0], rows[:1])
 
         rc, out = run(["a_ok", "c_exit", "d_never"], tag="exit")
         rows = list(csv.DictReader(open(sorted(out.glob("*.csv"))[0], encoding="utf-8")))
